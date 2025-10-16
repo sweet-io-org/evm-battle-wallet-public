@@ -1,0 +1,7 @@
+{
+  "contractName": "StorageSlot",
+  "sourceName": "@openzeppelin/contracts/utils/StorageSlot.sol",
+  "bytecode": "0x60808060405234601757603a9081601d823930815050f35b600080fdfe600080fdfea2646970667358221220231fbed5e73be7fd05387c6da7b3b42c98efae5847beff3f5f46d5aa7f3e543064736f6c634300081e0033",
+  "deployedBytecode": "0x600080fdfea2646970667358221220231fbed5e73be7fd05387c6da7b3b42c98efae5847beff3f5f46d5aa7f3e543064736f6c634300081e0033",
+  "linkReferences": {}
+}
