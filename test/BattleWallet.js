@@ -189,7 +189,7 @@ async function signUpgrade(signer, domain, walletAddress, newImplementation, dat
 
 describe("BattleWallet (EVM)", () => {
   async function deployFixture() {
-    const [owner, adminOwner, adminSigner, user, opponent, feeWallet, stranger] = await ethers.getSigners();
+    const [owner, factoryOwner, adminSigner, user, opponent, feeWallet, stranger] = await ethers.getSigners();
     const { chainId } = await ethers.provider.getNetwork();
     const Wallet = await ethers.getContractFactory("BattleWallet");
     const walletImplementation = await Wallet.deploy();
@@ -203,13 +203,13 @@ describe("BattleWallet (EVM)", () => {
     const Factory = await ethers.getContractFactory("BattleWalletFactory");
     const factory = await Factory.deploy(
       walletImplementation.target,
-      adminOwner.address,
+      factoryOwner.address,
       adminSigner.address,
       token.target,
     );
     await factory.waitForDeployment();
 
-    await factory.connect(adminOwner).setReservationTtl(60);
+    await factory.connect(factoryOwner).setReservationTtl(60);
 
     const walletAddress = await factory.predictBattleWalletAddress(owner.address);
     await factory.deployBattleWallet(owner.address);
@@ -228,7 +228,7 @@ describe("BattleWallet (EVM)", () => {
       factory,
       token,
       owner,
-      adminOwner,
+      factoryOwner,
       adminSigner,
       user,
       opponent,
@@ -240,7 +240,7 @@ describe("BattleWallet (EVM)", () => {
   }
 
   async function factoryFixture() {
-    const [owner, adminOwner, adminSigner] = await ethers.getSigners();
+    const [owner, factoryOwner, adminSigner] = await ethers.getSigners();
     const { chainId } = await ethers.provider.getNetwork();
     const Wallet = await ethers.getContractFactory("BattleWallet");
     const walletImplementation = await Wallet.deploy();
@@ -254,13 +254,13 @@ describe("BattleWallet (EVM)", () => {
     const Factory = await ethers.getContractFactory("BattleWalletFactory");
     const factory = await Factory.deploy(
       walletImplementation.target,
-      adminOwner.address,
+      factoryOwner.address,
       adminSigner.address,
       token.target,
     );
     await factory.waitForDeployment();
 
-    return { factory, walletImplementation, owner, adminOwner, chainId, token };
+    return { factory, walletImplementation, owner, factoryOwner, chainId, token };
   }
 
   describe("factory", () => {
@@ -302,7 +302,7 @@ describe("BattleWallet (EVM)", () => {
     });
 
     it("allows deployment even if the token address is zero", async () => {
-      const [owner, adminOwner, adminSigner] = await ethers.getSigners();
+      const [owner, factoryOwner, adminSigner] = await ethers.getSigners();
       const Wallet = await ethers.getContractFactory("BattleWallet");
       const implementation = await Wallet.deploy();
       await implementation.waitForDeployment();
@@ -310,7 +310,7 @@ describe("BattleWallet (EVM)", () => {
       const Factory = await ethers.getContractFactory("BattleWalletFactory");
       const factory = await Factory.deploy(
         implementation.target,
-        adminOwner.address,
+        factoryOwner.address,
         adminSigner.address,
         ethers.ZeroAddress,
       );
@@ -321,6 +321,34 @@ describe("BattleWallet (EVM)", () => {
       const wallet = await ethers.getContractAt("BattleWallet", predicted);
       expect(await wallet.tokenSet()).to.equal(false);
     });
+
+    it("updates the factory owner through the two-step transfer", async () => {
+      const { factory, factoryOwner, owner, adminSigner } = await loadFixture(factoryFixture);
+
+      await expect(factory.connect(factoryOwner).transferOwnership(owner.address))
+        .to.emit(factory, "OwnershipTransferStarted")
+        .withArgs(factoryOwner.address, owner.address);
+
+      await expect(factory.connect(owner).setApprover(owner.address))
+        .to.be.revertedWithCustomError(factory, "OwnableUnauthorizedAccount")
+        .withArgs(owner.address);
+
+      await expect(factory.connect(owner).acceptOwnership())
+        .to.emit(factory, "OwnershipTransferred")
+        .withArgs(factoryOwner.address, owner.address);
+
+      expect(await factory.owner()).to.equal(owner.address);
+
+      await expect(factory.connect(factoryOwner).setApprover(owner.address))
+        .to.be.revertedWithCustomError(factory, "OwnableUnauthorizedAccount")
+        .withArgs(factoryOwner.address);
+
+      await expect(factory.connect(owner).setApprover(owner.address))
+        .to.emit(factory, "ApproverUpdated")
+        .withArgs(owner.address);
+    });
+
+      
   });
 
   describe("nonce tracking", () => {
@@ -927,11 +955,11 @@ describe("BattleWallet (EVM)", () => {
     });
 
     it("no limit to active wagers and releases ether after ttl", async () => {
-      const { chainId, wallet, walletAddress, factory, owner, adminSigner, opponentWalletAddress, adminOwner } =
+      const { chainId, wallet, walletAddress, factory, owner, adminSigner, opponentWalletAddress, factoryOwner } =
         await loadFixture(deployFixture);
 
       const extendedTtl = 3600;
-      await factory.connect(adminOwner).setReservationTtl(extendedTtl);
+      await factory.connect(factoryOwner).setReservationTtl(extendedTtl);
 
       const nonces = new Map();
       const factoryDomain = buildFactoryDomain(factory, chainId);
@@ -978,7 +1006,7 @@ describe("BattleWallet (EVM)", () => {
         walletAddress,
         factory,
         adminSigner,
-        adminOwner,
+        factoryOwner,
         owner,
         opponentWallet,
         opponentWalletAddress,
@@ -1016,7 +1044,7 @@ describe("BattleWallet (EVM)", () => {
       );
 
       // set newSigner as the new signer
-      await factory.connect(adminOwner).setApprover(newSigner.address);
+      await factory.connect(factoryOwner).setApprover(newSigner.address);
 
       const newRequest = withFactory(factory, {
         ...baseFields,
@@ -1054,13 +1082,13 @@ describe("BattleWallet (EVM)", () => {
     });
 
     it("only owner can set and unset approval", async () => {
-      const { wallet, owner, adminOwner } = await loadFixture(deployFixture);
+      const { wallet, owner, factoryOwner } = await loadFixture(deployFixture);
 
       expect(await wallet.getApprovalRequired()).to.equal(false);
       await wallet.connect(owner).setApprovalRequired(true);
       expect(await wallet.getApprovalRequired()).to.equal(true);
 
-      await expect(wallet.connect(adminOwner).setApprovalRequired(false)).to.be.revertedWithCustomError(
+      await expect(wallet.connect(factoryOwner).setApprovalRequired(false)).to.be.revertedWithCustomError(
         wallet,
         "SenderNotAllowed"
       );
@@ -1076,7 +1104,7 @@ describe("BattleWallet (EVM)", () => {
         factory,
         owner,
         adminSigner,
-        adminOwner,
+        factoryOwner,
         stranger,
         opponentWalletAddress,
       } =
@@ -1385,14 +1413,14 @@ describe("BattleWallet (EVM)", () => {
         factory,
         owner,
         adminSigner,
-        adminOwner,
+        factoryOwner,
         opponentWalletAddress,
         token,
         deposit,
       } = await loadFixture(setupTokenFixture);
 
       const extendedTtl = 3600;
-      await factory.connect(adminOwner).setReservationTtl(extendedTtl);
+      await factory.connect(factoryOwner).setReservationTtl(extendedTtl);
 
       const nonces = new Map();
       const factoryDomain = buildFactoryDomain(factory, chainId);
@@ -1435,7 +1463,7 @@ describe("BattleWallet (EVM)", () => {
 
   describe("large scale lifecycle management", () => {
     async function setupMassFixture() {
-      const [owner, adminOwner, adminSigner, feeWallet, opponentOne, opponentTwo, opponentThree] =
+      const [owner, factoryOwner, adminSigner, feeWallet, opponentOne, opponentTwo, opponentThree] =
         await ethers.getSigners();
       const { chainId } = await ethers.provider.getNetwork();
 
@@ -1451,13 +1479,13 @@ describe("BattleWallet (EVM)", () => {
       const Factory = await ethers.getContractFactory("BattleWalletFactory");
       const factory = await Factory.deploy(
         walletImplementation.target,
-        adminOwner.address,
+        factoryOwner.address,
         adminSigner.address,
         token.target,
       );
       await factory.waitForDeployment();
 
-      await factory.connect(adminOwner).setReservationTtl(3000);
+      await factory.connect(factoryOwner).setReservationTtl(3000);
 
       const walletAddress = await factory.predictBattleWalletAddress(owner.address);
       await factory.deployBattleWallet(owner.address);
@@ -1616,14 +1644,14 @@ describe("BattleWallet (EVM)", () => {
     }
 
     it("requires owner signature to upgrade wallet", async () => {
-      const { chainId, factory, walletAddress, owner, adminOwner } = await loadFixture(deployFixture);
+      const { chainId, factory, walletAddress, owner, factoryOwner } = await loadFixture(deployFixture);
       const proxy = await ethers.getContractAt("BattleWalletProxy", walletAddress);
       const newImplementation = await deployUpgradeImplementation();
 
       const nonce = await proxy.upgradeNonce();
       await expect(
         factory
-          .connect(adminOwner)
+          .connect(factoryOwner)
           .upgradeBattleWallet(walletAddress, newImplementation.target, "0x", EMPTY_SIG)
       ).to.be.revertedWithCustomError(proxy, "InvalidSignature");
 
@@ -1632,7 +1660,7 @@ describe("BattleWallet (EVM)", () => {
 
       await expect(
         factory
-          .connect(adminOwner)
+          .connect(factoryOwner)
           .upgradeBattleWallet(walletAddress, newImplementation.target, "0x", signature)
       )
         .to.emit(factory, "BattleWalletUpgraded")
@@ -1643,7 +1671,7 @@ describe("BattleWallet (EVM)", () => {
     });
 
     it("increments upgrade nonce and prevents signature reuse", async () => {
-      const { chainId, factory, walletAddress, owner, adminOwner } = await loadFixture(deployFixture);
+      const { chainId, factory, walletAddress, owner, factoryOwner } = await loadFixture(deployFixture);
       const proxy = await ethers.getContractAt("BattleWalletProxy", walletAddress);
       const newImplementation = await deployUpgradeImplementation();
 
@@ -1652,7 +1680,7 @@ describe("BattleWallet (EVM)", () => {
       const signature = await signUpgrade(owner, proxyDomain, walletAddress, newImplementation.target, "0x", nonce);
 
       await factory
-        .connect(adminOwner)
+        .connect(factoryOwner)
         .upgradeBattleWallet(walletAddress, newImplementation.target, "0x", signature);
 
       const nextNonce = await proxy.upgradeNonce();
@@ -1660,13 +1688,13 @@ describe("BattleWallet (EVM)", () => {
 
       await expect(
         factory
-          .connect(adminOwner)
+          .connect(factoryOwner)
           .upgradeBattleWallet(walletAddress, newImplementation.target, "0x", signature)
       ).to.be.revertedWithCustomError(proxy, "InvalidSignature");
     });
 
     it("only allows factory admin to perform upgrades", async () => {
-      const { chainId, factory, walletAddress, owner, adminOwner } = await loadFixture(deployFixture);
+      const { chainId, factory, walletAddress, owner, factoryOwner } = await loadFixture(deployFixture);
       const newImplementation = await deployUpgradeImplementation();
       const proxy = await ethers.getContractAt("BattleWalletProxy", walletAddress);
       const nonce = await proxy.upgradeNonce();
@@ -1677,10 +1705,10 @@ describe("BattleWallet (EVM)", () => {
         factory
           .connect(owner)
           .upgradeBattleWallet(walletAddress, newImplementation.target, "0x", signature)
-      ).to.be.revertedWithCustomError(factory, "Unauthorized");
+      ).to.be.revertedWithCustomError(factory, "OwnableUnauthorizedAccount");
 
       await factory
-        .connect(adminOwner)
+        .connect(factoryOwner)
         .upgradeBattleWallet(walletAddress, newImplementation.target, "0x", signature);
     });
   });

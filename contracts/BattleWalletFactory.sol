@@ -5,13 +5,14 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Create2} from "@openzeppelin/contracts/utils/Create2.sol";
+import {Ownable, Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
 import {BattleWallet} from "./BattleWallet.sol";
 import {BattleWalletProxy} from "./BattleWalletProxy.sol";
 
 /// @title BattleWalletFactory
 /// @notice Deploys BattleWallet proxies using ERC-1967 upgradeable proxies and manages shared configuration.
-contract BattleWalletFactory is ReentrancyGuard, EIP712 {
+contract BattleWalletFactory is ReentrancyGuard, EIP712, Ownable2Step {
 
     // ─────────────────────────────────────────────────────────────────────────────
     // Errors
@@ -28,7 +29,6 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712 {
     event BattleWalletDeployed(address indexed owner, address indexed proxy, address implementation);
     event WalletImplementationUpgraded(address indexed newImplementation);
     event BattleWalletUpgraded(address indexed proxy, address indexed newImplementation);
-    event AdminUpdated(address indexed newAdmin);
     event ApproverUpdated(address indexed newApprover);
     event ReservationTtlUpdated(uint64 newTtl);
 
@@ -36,7 +36,6 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712 {
     // Storage
     // ─────────────────────────────────────────────────────────────────────────────
     address public walletImplementation;
-    address public admin;
     address public approver;
     address public immutable token;
     uint64 public reservationTtl;
@@ -58,23 +57,17 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712 {
         _;
     }
 
-    modifier onlyAdmin() {
-        if (msg.sender != admin) revert Unauthorized();
-        _;
-    }
-
     constructor(
         address implementation_,
-        address admin_,
+        address owner_,
         address approver_,
         address token_
-    ) EIP712("BattleWalletFactory", "1") {
+    ) EIP712("BattleWalletFactory", "1") Ownable(owner_) {
         // token_ can be zero address, in which case ERC-20 not supported
-        if (implementation_ == address(0) || admin_ == address(0) || approver_ == address(0)) {
+        if (implementation_ == address(0) || owner_ == address(0) || approver_ == address(0)) {
             revert ZeroAddress();
         }
         walletImplementation = implementation_;
-        admin = admin_;
         approver = approver_;
         token = token_;
         reservationTtl = 3600;
@@ -111,7 +104,7 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712 {
 
     /// @notice Updates the implementation used for future BattleWallet deployments.
     /// @param newImplementation The address of the new BattleWallet implementation contract.
-    function upgradeWalletImplementation(address newImplementation) external onlyAdmin {
+    function upgradeWalletImplementation(address newImplementation) external onlyOwner {
         if (newImplementation == address(0)) revert ZeroAddress();
         walletImplementation = newImplementation;
         emit WalletImplementationUpgraded(newImplementation);
@@ -127,7 +120,7 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712 {
         address newImplementation,
         bytes calldata data,
         bytes calldata ownerSignature
-    ) external onlyAdmin {
+    ) external onlyOwner {
         if (walletAddress == address(0) || newImplementation == address(0)) revert ZeroAddress();
 
         _validateWallet(walletAddress);
@@ -136,21 +129,14 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712 {
     }
 
     /// @notice Updates the aprover address used for newly deployed wallets.
-    function setApprover(address newApprover) external onlyAdmin {
+    function setApprover(address newApprover) external onlyOwner {
         if (newApprover == address(0)) revert ZeroAddress();
         approver = newApprover;
         emit ApproverUpdated(newApprover);
     }
 
-    /// @notice Updates admin account.
-    function setAdmin(address newAdmin) external onlyAdmin {
-        if (newAdmin == address(0)) revert ZeroAddress();
-        admin = newAdmin;
-        emit AdminUpdated(newAdmin);
-    }
-
     /// @notice Updates the reservation TTL used for new reservations.
-    function setReservationTtl(uint64 newTtl) external onlyAdmin {
+    function setReservationTtl(uint64 newTtl) external onlyOwner {
         if (newTtl < 30 || newTtl > 864000) revert InvalidReservationTtl();
         reservationTtl = newTtl;
         emit ReservationTtlUpdated(newTtl);
