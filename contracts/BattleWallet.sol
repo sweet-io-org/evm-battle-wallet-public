@@ -38,6 +38,7 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
     error ZeroAddress();
     error InvalidFactory();
     error InvalidNonce();
+    error InvalidGameId();
 
     // ─────────────────────────────────────────────────────────────────────────────
     // Types
@@ -185,7 +186,6 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
             totalReservedEth -= res.amount;
         }
         emit ReservationSettled(request.gameId, request.winner, request.loser, res.amount, res.isToken);
-        //console.log("%s setting game %s inactive (settled)", owner, request.gameId);
         res.active = false;
     }
 
@@ -197,7 +197,6 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
 
         emit ReservationSettled(request.gameId, request.winner, request.loser, res.amount, res.isToken);
         res.active = false;
-        //console.log("%s setting game %s inactive (settled)", owner, request.gameId);
         if (res.opponent != request.winner) revert AddressMismatch();
         if (res.isToken) {
             uint256 tokenBalance = token.balanceOf(address(this));
@@ -217,6 +216,11 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
         _releaseExpiredInternal();
     }
 
+    function releaseExpiredFullTraverse() external {
+        if (msg.sender != factory && msg.sender != owner) revert SenderNotAllowed();
+        _releaseExpiredInternalFullTraverse();
+    }
+
     function cancel(uint64 gameId) external onlyFactory {
         Reservation storage res = reservations[gameId];
         if (!res.exists || !res.active) revert GameNotFound();
@@ -228,7 +232,6 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
             totalReservedEth -= res.amount;
         }
         res.active = false;
-        //console.log("%s setting game %s inactive (cancelled)", owner, gameId);
         emit ReservationCancelled(gameId);
     }
 
@@ -290,7 +293,6 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
                 break;
             }
             if (res.active) {
-                //console.log("%s calculating for game %s", owner, currGameId);
                 if (res.isToken) {
                     if (res.amount > tokenReserved) revert AmountGreaterThanReserved();
                     tokenReserved -= res.amount;
@@ -314,10 +316,12 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
         returns (uint256 amount, address opponent, uint64 expire, bool isToken, bool found)
     {
         Reservation storage res = reservations[gameId];
+        // if settled or canceled, return zero/false
         if (!res.exists || !res.active) {
             return (0, address(0), 0, false, false);
         }
-        if (!(res.expiration < block.timestamp)) {
+        // if expired, return zero/false
+        if (res.expiration <= block.timestamp) {
             return (0, address(0), 0, false, false);
         }
         return (res.amount, res.opponent, res.expiration, res.isToken, true);
@@ -378,6 +382,7 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
         if (request.factory != factory) revert InvalidFactory();
         if (request.feeBasisPoints > 2500) revert InvalidFeeBasisPoints();
         if (request.feeBasisPoints > 0 && request.feeWallet == address(0)) revert ZeroAddress();
+        if (request.gameId <= 0) revert InvalidGameId();
 
         (address opponent, bool isPlayerOne) = _identifyOpponent(request.player1, request.player2);
         uint64 providedNonce = isPlayerOne ? request.noncePlayer1 : request.noncePlayer2;
@@ -471,6 +476,65 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
         // performing within the loop (efficiency)
         if (firstGameId != currGameId) {
             firstGameId = currGameId;
+        }
+        if (totalReservedEth != totalEth) {
+            totalReservedEth = totalEth;
+        }
+        if (totalReservedToken != totalToken) {
+            totalReservedToken = totalToken;
+        }
+    }
+
+    function _releaseExpiredInternalFullTraverse() private {
+        uint64 currGameId = firstGameId;
+        if (currGameId == 0) {
+            return;
+        }
+
+        uint256 currentTime = block.timestamp;
+        uint256 totalEth = totalReservedEth;
+        uint256 totalToken = totalReservedToken;
+
+        uint64 prevGameId = 0;
+
+        while (currGameId != 0) {
+            Reservation storage res = reservations[currGameId];
+            uint64 nextGameId = res.nextGameId;
+
+            if (currentTime >= res.expiration) {
+                if (res.active) {
+                    if (res.isToken) {
+                        if (res.amount > totalToken) revert AmountGreaterThanReserved();
+                        totalToken -= res.amount;
+                    } else {
+                        if (res.amount > totalEth) revert AmountGreaterThanReserved();
+                        totalEth -= res.amount;
+                    }
+                }
+
+                if (prevGameId == 0) {
+                    firstGameId = nextGameId;
+                } else {
+                    reservations[prevGameId].nextGameId = nextGameId;
+                }
+
+                if (nextGameId == 0) {
+                    lastGameId = prevGameId;
+                }
+
+                delete reservations[currGameId];
+            } else {
+                prevGameId = currGameId;
+                if (nextGameId == 0) {
+                    lastGameId = currGameId;
+                }
+            }
+
+            currGameId = nextGameId;
+        }
+
+        if (firstGameId == 0) {
+            lastGameId = 0;
         }
         if (totalReservedEth != totalEth) {
             totalReservedEth = totalEth;

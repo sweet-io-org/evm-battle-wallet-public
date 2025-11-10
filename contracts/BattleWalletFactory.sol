@@ -40,14 +40,20 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712, Ownable2Step {
     address public immutable token;
     uint64 public reservationTtl;
 
+    mapping(address => bool) private deployedWallets;
+
     bytes32 private constant RESERVE_TYPEHASH = keccak256(
         "RESERVE(uint64 gameId,uint256 amount,address player1,address player2,bool isToken,uint64 noncePlayer1,uint64 noncePlayer2,address feeWallet,uint16 feeBasisPoints,address factory)"
     );
     bytes32 private constant SETTLE_TYPEHASH = keccak256(
-        "SETTLE(uint64 gameId,address winner,address loser,address factory)"
+        "SETTLE(uint64 gameId,address winner,address loser,address factory,uint64 expiresAt)"
     );
-    bytes32 private constant CANCEL_TYPEHASH = keccak256("CANCEL(uint64 gameId,address factory)");
-    bytes32 private constant RELEASE_EXPIRED_TYPEHASH = keccak256("RELEASE_EXPIRED(address wallet,address factory)");
+    bytes32 private constant CANCEL_TYPEHASH = keccak256(
+        "CANCEL(uint64 gameId,address walletOne,address walletTwo,address factory,uint64 expiresAt)"
+    );
+    bytes32 private constant RELEASE_EXPIRED_TYPEHASH = keccak256(
+        "RELEASE_EXPIRED(address wallet,address factory,bool fullTraverse,uint64 expiresAt)"
+    );
 
     // ─────────────────────────────────────────────────────────────────────────────
     // Modifiers
@@ -85,6 +91,7 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712, Ownable2Step {
         proxy = address(new BattleWalletProxy{salt: salt}(walletImplementation, address(this), ""));
         BattleWallet battleWallet = BattleWallet(payable(proxy));
         battleWallet.initialize(walletOwner, token);
+        deployedWallets[proxy] = true;
         emit BattleWalletDeployed(walletOwner, proxy, walletImplementation);
     }
 
@@ -122,8 +129,7 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712, Ownable2Step {
         bytes calldata ownerSignature
     ) external onlyOwner {
         if (walletAddress == address(0) || newImplementation == address(0)) revert ZeroAddress();
-
-        _validateWallet(walletAddress);
+        _verifyWallet(walletAddress);
         BattleWalletProxy(payable(walletAddress)).upgradeWallet(newImplementation, data, ownerSignature);
         emit BattleWalletUpgraded(walletAddress, newImplementation);
     }
@@ -155,8 +161,8 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712, Ownable2Step {
     ) external {
         _verifyReserveSignature(reserveRequest, reserveSignature);
         if (reserveRequest.factory != address(this)) revert InvalidSignature();
-        BattleWallet walletOne = _validateWallet(reserveRequest.player1);
-        BattleWallet walletTwo = _validateWallet(reserveRequest.player2);
+        BattleWallet walletOne = _verifyWallet(reserveRequest.player1);
+        BattleWallet walletTwo = _verifyWallet(reserveRequest.player2);
 
         // ttl is applied uniformly by the factory. it's more useful that this is
         // sequential, since allows efficient trimming of reservations. and no 
@@ -176,12 +182,13 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712, Ownable2Step {
     /// @dev Calls revert entirely if any of the underlying wallet calls fail.
     function relaySettle(
         BattleWallet.SettlementRequest calldata settlementRequest,
+        uint64 expiresAt,
         bytes calldata settlementSignature
     ) external nonReentrant {
-        _verifySettlementSignature(settlementRequest, settlementSignature);
+        _verifySettlementSignature(settlementRequest, expiresAt, settlementSignature);
         if (settlementRequest.factory != address(this)) revert InvalidSignature();
-        BattleWallet winnerWallet = _validateWallet(settlementRequest.winner);
-        BattleWallet loserWallet = _validateWallet(settlementRequest.loser);
+        BattleWallet winnerWallet = _verifyWallet(settlementRequest.winner);
+        BattleWallet loserWallet = _verifyWallet(settlementRequest.loser);
 
         loserWallet.settleForLoser(settlementRequest);
         winnerWallet.settleForWinner(settlementRequest);
@@ -193,11 +200,12 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712, Ownable2Step {
         address walletOne,
         address walletTwo,
         uint64 gameId,
+        uint64 expiresAt,
         bytes calldata cancelSignature
     ) external {
-        _verifyCancelSignature(gameId, cancelSignature);
-        BattleWallet firstWallet = _validateWallet(walletOne);
-        BattleWallet secondWallet = _validateWallet(walletTwo);
+        _verifyCancelSignature(walletOne, walletTwo, gameId, expiresAt, cancelSignature);
+        BattleWallet firstWallet = _verifyWallet(walletOne);
+        BattleWallet secondWallet = _verifyWallet(walletTwo);
 
         firstWallet.cancel(gameId);
         secondWallet.cancel(gameId);
@@ -205,10 +213,19 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712, Ownable2Step {
 
     /// @notice Relays a releaseExpired call to a BattleWallet contract.
     /// @dev Any caller may trigger cleanup as it only affects the wallet's internal accounting.
-    function relayReleaseExpired(address walletAddress, bytes calldata releaseSignature) external {
-        _verifyReleaseSignature(walletAddress, releaseSignature);
-        BattleWallet battleWallet = _validateWallet(walletAddress);
-        battleWallet.releaseExpired();
+    function relayReleaseExpired(
+        address walletAddress,
+        bool fullTraverse,
+        uint64 expiresAt,
+        bytes calldata releaseSignature
+    ) external {
+        _verifyReleaseSignature(walletAddress, fullTraverse, expiresAt, releaseSignature);
+        BattleWallet battleWallet = _verifyWallet(walletAddress);
+        if (fullTraverse) {
+            battleWallet.releaseExpiredFullTraverse();
+        } else {
+            battleWallet.releaseExpired();
+        }
     }
 
     /// @dev Generates the deterministic salt used for deployments.
@@ -239,15 +256,18 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712, Ownable2Step {
 
     function _verifySettlementSignature(
         BattleWallet.SettlementRequest calldata request,
+        uint64 expiresAt,
         bytes calldata signature
     ) private view {
+        if (block.timestamp > expiresAt) revert InvalidSignature();
         bytes32 structHash = keccak256(
             abi.encode(
                 SETTLE_TYPEHASH,
                 request.gameId,
                 request.winner,
                 request.loser,
-                request.factory
+                request.factory,
+                expiresAt
             )
         );
         bytes32 digest = _hashTypedDataV4(structHash);
@@ -255,31 +275,42 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712, Ownable2Step {
         if (signer != approver) revert InvalidSignature();
     }
 
-    function _verifyCancelSignature(uint64 gameId, bytes calldata signature) private view {
-        bytes32 structHash = keccak256(abi.encode(CANCEL_TYPEHASH, gameId, address(this)));
+    function _verifyCancelSignature(
+        address walletOne,
+        address walletTwo,
+        uint64 gameId,
+        uint64 expiresAt,
+        bytes calldata signature
+    ) private view {
+        if (block.timestamp > expiresAt) revert InvalidSignature();
+        bytes32 structHash = keccak256(
+            abi.encode(CANCEL_TYPEHASH, gameId, walletOne, walletTwo, address(this), expiresAt)
+        );
         bytes32 digest = _hashTypedDataV4(structHash);
         address signer = ECDSA.recover(digest, signature);
         if (signer != approver) revert InvalidSignature();
     }
 
-    function _verifyReleaseSignature(address walletAddress, bytes calldata signature) private view {
-        bytes32 structHash = keccak256(abi.encode(RELEASE_EXPIRED_TYPEHASH, walletAddress, address(this)));
+    function _verifyReleaseSignature(
+        address walletAddress,
+        bool fullTraverse,
+        uint64 expiresAt,
+        bytes calldata signature
+    ) private view {
+        if (block.timestamp > expiresAt) revert InvalidSignature();
+        bytes32 structHash = keccak256(
+            abi.encode(RELEASE_EXPIRED_TYPEHASH, walletAddress, address(this), fullTraverse, expiresAt)
+        );
         bytes32 digest = _hashTypedDataV4(structHash);
         address signer = ECDSA.recover(digest, signature);
         if (signer != approver) revert InvalidSignature();
     }
 
-    function _validateWallet(address wallet) private view returns (BattleWallet battleWallet) {
+    function _verifyWallet(address wallet) private view returns (BattleWallet battleWallet) {
         if (wallet == address(0)) revert ZeroAddress();
-
-        battleWallet = BattleWallet(payable(wallet));
-        (bool success, bytes memory data) = wallet.staticcall(abi.encodeWithSignature("factory()"));
-        if (!success || data.length != 32) {
+        if (!deployedWallets[wallet]) {
             revert InvalidWallet();
         }
-        address walletFactory = abi.decode(data, (address));
-        if (walletFactory != address(this)) {
-            revert InvalidWallet();
-        }
+        battleWallet = BattleWallet(payable(wallet));        
     }
 }

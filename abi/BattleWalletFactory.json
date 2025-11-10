@@ -392,6 +392,11 @@
         "type": "uint64"
       },
       {
+        "internalType": "uint64",
+        "name": "expiresAt",
+        "type": "uint64"
+      },
+      {
         "internalType": "bytes",
         "name": "cancelSignature",
         "type": "bytes"
@@ -408,6 +413,16 @@
         "internalType": "address",
         "name": "walletAddress",
         "type": "address"
+      },
+      {
+        "internalType": "bool",
+        "name": "fullTraverse",
+        "type": "bool"
+      },
+      {
+        "internalType": "uint64",
+        "name": "expiresAt",
+        "type": "uint64"
       },
       {
         "internalType": "bytes",
@@ -528,6 +543,11 @@
         "internalType": "struct BattleWallet.SettlementRequest",
         "name": "settlementRequest",
         "type": "tuple"
+      },
+      {
+        "internalType": "uint64",
+        "name": "expiresAt",
+        "type": "uint64"
       },
       {
         "internalType": "bytes",

@@ -114,6 +114,11 @@
   },
   {
     "inputs": [],
+    "name": "InvalidGameId",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "InvalidNonce",
     "type": "error"
   },
@@ -567,6 +572,13 @@
   {
     "inputs": [],
     "name": "releaseExpired",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "releaseExpiredFullTraverse",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"

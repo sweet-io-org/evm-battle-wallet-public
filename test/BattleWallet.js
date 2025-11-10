@@ -22,7 +22,10 @@ const RESERVE_TYPES = {
 const CANCEL_TYPES = {
   CANCEL: [
     { name: "gameId", type: "uint64" },
+    { name: "walletOne", type: "address" },
+    { name: "walletTwo", type: "address" },
     { name: "factory", type: "address" },
+    { name: "expiresAt", type: "uint64" },
   ],
 };
 
@@ -30,6 +33,8 @@ const RELEASE_EXPIRED_TYPES = {
   RELEASE_EXPIRED: [
     { name: "wallet", type: "address" },
     { name: "factory", type: "address" },
+    { name: "fullTraverse", type: "bool" },
+    { name: "expiresAt", type: "uint64" },
   ],
 };
 
@@ -39,6 +44,7 @@ const SETTLE_TYPES = {
     { name: "winner", type: "address" },
     { name: "loser", type: "address" },
     { name: "factory", type: "address" },
+    { name: "expiresAt", type: "uint64" },
   ],
 };
 
@@ -52,6 +58,13 @@ const UPGRADE_TYPES = {
 };
 
 const EMPTY_SIG = "0x";
+
+const DEFAULT_SIGNATURE_TTL = 3600n;
+
+async function buildExpiration(delta = DEFAULT_SIGNATURE_TTL) {
+  const latest = BigInt(await time.latest());
+  return latest + delta;
+}
 
 function buildDomain(name, verifyingContract, chainId) {
   return {
@@ -104,16 +117,18 @@ function relayReserveTx(factory, caller, request, signature, approvals = {}) {
     .relayReserve(request, signature, approvalOne, approvalTwo);
 }
 
-function relaySettleTx(factory, caller, settlement, signature) {
-  return factory.connect(caller).relaySettle(settlement, signature);
+function relaySettleTx(factory, caller, settlement, expiresAt, signature) {
+  return factory.connect(caller).relaySettle(settlement, expiresAt, signature);
 }
 
-function relayCancelTx(factory, caller, walletOne, walletTwo, gameId, signature) {
-  return factory.connect(caller).relayCancel(walletOne, walletTwo, gameId, signature);
+function relayCancelTx(factory, caller, walletOne, walletTwo, gameId, expiresAt, signature) {
+  return factory
+    .connect(caller)
+    .relayCancel(walletOne, walletTwo, gameId, expiresAt, signature);
 }
 
-function relayReleaseExpiredTx(factory, caller, walletAddress, signature) {
-  return factory.connect(caller).relayReleaseExpired(walletAddress, signature);
+function relayReleaseExpiredTx(factory, caller, walletAddress, fullTraverse, expiresAt, signature) {
+  return factory.connect(caller).relayReleaseExpired(walletAddress, fullTraverse, expiresAt, signature);
 }
 
 function randomInt(min, max) {
@@ -160,22 +175,27 @@ function withFactory(contractRef, params) {
   };
 }
 
-async function signCancel(signer, domain, gameId, factoryOverride) {
+async function signCancel(signer, domain, gameId, walletOne, walletTwo, expiresAt, factoryOverride) {
   return signer.signTypedData(domain, CANCEL_TYPES, {
     gameId,
+    walletOne,
+    walletTwo,
     factory: factoryOverride ?? domain.verifyingContract,
+    expiresAt,
   });
 }
 
-async function signReleaseExpired(signer, domain, walletAddress, factoryOverride) {
+async function signReleaseExpired(signer, domain, walletAddress, fullTraverse, expiresAt, factoryOverride) {
   return signer.signTypedData(domain, RELEASE_EXPIRED_TYPES, {
     wallet: walletAddress,
     factory: factoryOverride ?? domain.verifyingContract,
+    fullTraverse,
+    expiresAt,
   });
 }
 
-async function signSettlement(signer, domain, request) {
-  return signer.signTypedData(domain, SETTLE_TYPES, request);
+async function signSettlement(signer, domain, request, expiresAt) {
+  return signer.signTypedData(domain, SETTLE_TYPES, { ...request, expiresAt });
 }
 
 async function signUpgrade(signer, domain, walletAddress, newImplementation, data, nonce) {
@@ -368,8 +388,7 @@ describe("BattleWallet (EVM)", () => {
       });
       const factoryDomain = buildFactoryDomain(factory, chainId);
       const signature = await signReserve(adminSigner, factoryDomain, request);
-      await relayReserveTx(factory, owner, request, signature);
-
+      const relayResult = await relayReserveTx(factory, owner, request, signature);
       expect(await wallet.getCurrentNonce()).to.equal(1n);
     });
   });
@@ -398,7 +417,7 @@ describe("BattleWallet (EVM)", () => {
       expect(totals[1]).to.equal(0n);
 
       const [, , , , found] = await wallet.getReservationDetails(request.gameId);
-      expect(found).to.equal(false);
+      expect(found).to.equal(true);
     });
 
     it("rejects duplicate game ids", async () => {
@@ -592,13 +611,14 @@ describe("BattleWallet (EVM)", () => {
         winner: opponentWalletAddress,
         loser: walletAddress,
       });
-      const settleSig = await signSettlement(adminSigner, factoryDomain, settlement);
+      const settlementExpiresAt = await buildExpiration();
+      const settleSig = await signSettlement(adminSigner, factoryDomain, settlement, settlementExpiresAt);
 
       const beforeOpponent = await ethers.provider.getBalance(opponentWalletAddress);
       const beforeFee = await ethers.provider.getBalance(feeWallet.address);
 
       // event ReservationSettled(uint128 indexed gameId, address indexed winner, address indexed loser, uint256 amount, bool isToken);
-      await expect(relaySettleTx(factory, stranger, settlement, settleSig))
+      await expect(relaySettleTx(factory, stranger, settlement, settlementExpiresAt, settleSig))
         .to.emit(wallet, "ReservationSettled")
         .withArgs(settlement.gameId, settlement.winner, settlement.loser, request.amount, false);
 
@@ -642,9 +662,15 @@ describe("BattleWallet (EVM)", () => {
         winner: opponentWalletAddress,
         loser: opponentWalletAddress,
       });
-      const settleSigWrongFactory = await signSettlement(adminSigner, factoryDomain, wrongFactorySettlement);
+      const wrongFactoryExpiresAt = await buildExpiration();
+      const settleSigWrongFactory = await signSettlement(
+        adminSigner,
+        factoryDomain,
+        wrongFactorySettlement,
+        wrongFactoryExpiresAt,
+      );
       await expect(
-        relaySettleTx(factory, owner, wrongFactorySettlement, settleSigWrongFactory)
+        relaySettleTx(factory, owner, wrongFactorySettlement, wrongFactoryExpiresAt, settleSigWrongFactory)
       ).to.be.revertedWithCustomError(wallet, "AddressMismatch");
 
       const randomWallet = await ethers.Wallet.createRandom();
@@ -653,9 +679,15 @@ describe("BattleWallet (EVM)", () => {
         winner: opponentWalletAddress,
         loser: randomWallet.address,
       });
-      const settleSigExternalLoser = await signSettlement(adminSigner, factoryDomain, settlementExternalLoser);
+      const externalLoserExpiresAt = await buildExpiration();
+      const settleSigExternalLoser = await signSettlement(
+        adminSigner,
+        factoryDomain,
+        settlementExternalLoser,
+        externalLoserExpiresAt,
+      );
       await expect(
-        relaySettleTx(factory, owner, settlementExternalLoser, settleSigExternalLoser)
+        relaySettleTx(factory, owner, settlementExternalLoser, externalLoserExpiresAt, settleSigExternalLoser)
       ).to.be.revertedWithCustomError(factory, "InvalidWallet");
 
       const settlementExternalWinner = withFactory(factory, {
@@ -663,9 +695,15 @@ describe("BattleWallet (EVM)", () => {
         winner: randomWallet.address,
         loser: walletAddress,
       });
-      const settleSigExternalWinner = await signSettlement(adminSigner, factoryDomain, settlementExternalWinner);
+      const externalWinnerExpiresAt = await buildExpiration();
+      const settleSigExternalWinner = await signSettlement(
+        adminSigner,
+        factoryDomain,
+        settlementExternalWinner,
+        externalWinnerExpiresAt,
+      );
       await expect(
-        relaySettleTx(factory, owner, settlementExternalWinner, settleSigExternalWinner)
+        relaySettleTx(factory, owner, settlementExternalWinner, externalWinnerExpiresAt, settleSigExternalWinner)
       ).to.be.revertedWithCustomError(factory, "InvalidWallet");
     });
 
@@ -694,11 +732,48 @@ describe("BattleWallet (EVM)", () => {
       });
       const wrongFactorySettlement = { ...settlement, factory: bogusFactory };
       const wrongDomain = buildFactoryDomain(bogusFactory, chainId);
-      const settleSig = await signSettlement(adminSigner, wrongDomain, wrongFactorySettlement);
-      await expect(relaySettleTx(factory, owner, wrongFactorySettlement, settleSig)).to.be.revertedWithCustomError(
+      const wrongDomainExpiresAt = await buildExpiration();
+      const settleSig = await signSettlement(adminSigner, wrongDomain, wrongFactorySettlement, wrongDomainExpiresAt);
+      await expect(
+        relaySettleTx(factory, owner, wrongFactorySettlement, wrongDomainExpiresAt, settleSig)
+      ).to.be.revertedWithCustomError(
         factory,
         "InvalidSignature"
       );
+    });
+
+    it("rejects settlement signatures that are past expiration", async () => {
+      const { chainId, walletAddress, factory, adminSigner, owner, opponentWalletAddress, feeWallet } =
+        await loadFixture(deployFixture);
+      const nonces = new Map();
+      const request = withFactory(factory, {
+        gameId: await generateGameId(5_001n),
+        amount: ethers.parseEther("2"),
+        player1: walletAddress,
+        player2: opponentWalletAddress,
+        isToken: false,
+        ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+        feeWallet: feeWallet.address,
+        feeBasisPoints: 100,
+      });
+      const factoryDomain = buildFactoryDomain(factory, chainId);
+      const reserveSig = await signReserve(adminSigner, factoryDomain, request);
+      await relayReserveTx(factory, owner, request, reserveSig);
+      bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
+
+      const settlement = withFactory(factory, {
+        gameId: request.gameId,
+        winner: opponentWalletAddress,
+        loser: walletAddress,
+      });
+      const expiresAt = await buildExpiration(1n);
+      const settleSig = await signSettlement(adminSigner, factoryDomain, settlement, expiresAt);
+
+      await time.increase(5);
+
+      await expect(
+        relaySettleTx(factory, owner, settlement, expiresAt, settleSig)
+      ).to.be.revertedWithCustomError(factory, "InvalidSignature");
     });
 
     it("rejects settlement after expiry", async () => {
@@ -726,8 +801,16 @@ describe("BattleWallet (EVM)", () => {
         winner: opponentWalletAddress,
         loser: walletAddress,
       });
-      const settleSig = await signSettlement(adminSigner, factoryDomain, settlement);
-      await expect(relaySettleTx(factory, owner, settlement, settleSig)).to.be.revertedWithCustomError(
+      const expiredReservationExpiresAt = await buildExpiration();
+      const settleSig = await signSettlement(
+        adminSigner,
+        factoryDomain,
+        settlement,
+        expiredReservationExpiresAt,
+      );
+      await expect(
+        relaySettleTx(factory, owner, settlement, expiredReservationExpiresAt, settleSig)
+      ).to.be.revertedWithCustomError(
         wallet,
         "ReservationExpired"
       );
@@ -786,7 +869,15 @@ describe("BattleWallet (EVM)", () => {
       const reserveSig = await signReserve(adminSigner, factoryDomain, request);
       await relayReserveTx(factory, owner, request, reserveSig);
       bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
-      const cancelSig = await signCancel(adminSigner, factoryDomain, request.gameId);
+      const cancelExpiresAt = await buildExpiration();
+      const cancelSig = await signCancel(
+        adminSigner,
+        factoryDomain,
+        request.gameId,
+        walletAddress,
+        opponentWalletAddress,
+        cancelExpiresAt,
+      );
       await expect(
         relayCancelTx(
           factory,
@@ -794,6 +885,7 @@ describe("BattleWallet (EVM)", () => {
           walletAddress,
           opponentWalletAddress,
           request.gameId,
+          cancelExpiresAt,
           cancelSig
         )
       )
@@ -826,9 +918,139 @@ describe("BattleWallet (EVM)", () => {
 
       const bogusFactory = ethers.Wallet.createRandom().address;
       const bogusDomain = buildFactoryDomain(bogusFactory, chainId);
-      const cancelSig = await signCancel(adminSigner, bogusDomain, request.gameId, bogusFactory);
+      const bogusExpiresAt = await buildExpiration();
+      const cancelSig = await signCancel(
+        adminSigner,
+        bogusDomain,
+        request.gameId,
+        walletAddress,
+        opponentWalletAddress,
+        bogusExpiresAt,
+        bogusFactory
+      );
       await expect(
-        relayCancelTx(factory, owner, walletAddress, opponentWalletAddress, request.gameId, cancelSig)
+        relayCancelTx(
+          factory,
+          owner,
+          walletAddress,
+          opponentWalletAddress,
+          request.gameId,
+          bogusExpiresAt,
+          cancelSig,
+        )
+      ).to.be.revertedWithCustomError(factory, "InvalidSignature");
+    });
+
+    it("rejects cancellation signatures that are past expiration", async () => {
+      const { chainId, walletAddress, factory, adminSigner, owner, opponentWalletAddress } = await loadFixture(
+        deployFixture
+      );
+      const nonces = new Map();
+      const request = withFactory(factory, {
+        gameId: await generateGameId(11n),
+        amount: ethers.parseEther("1"),
+        player1: walletAddress,
+        player2: opponentWalletAddress,
+        isToken: false,
+        ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+      });
+      const factoryDomain = buildFactoryDomain(factory, chainId);
+      const reserveSig = await signReserve(adminSigner, factoryDomain, request);
+      await relayReserveTx(factory, owner, request, reserveSig);
+      bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
+
+      const expiresAt = await buildExpiration(1n);
+      const cancelSig = await signCancel(
+        adminSigner,
+        factoryDomain,
+        request.gameId,
+        walletAddress,
+        opponentWalletAddress,
+        expiresAt,
+      );
+
+      await time.increase(5);
+
+      await expect(
+        relayCancelTx(
+          factory,
+          owner,
+          walletAddress,
+          opponentWalletAddress,
+          request.gameId,
+          expiresAt,
+          cancelSig,
+        )
+      ).to.be.revertedWithCustomError(factory, "InvalidSignature");
+    });
+
+    it("rejects cancellation signatures that do not match both wallet addresses", async () => {
+      const {
+        chainId,
+        walletAddress,
+        factory,
+        adminSigner,
+        owner,
+        opponentWalletAddress,
+        stranger,
+      } = await loadFixture(deployFixture);
+      const nonces = new Map();
+      const request = withFactory(factory, {
+        gameId: await generateGameId(10n),
+        amount: ethers.parseEther("1"),
+        player1: walletAddress,
+        player2: opponentWalletAddress,
+        isToken: false,
+        ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+      });
+      const factoryDomain = buildFactoryDomain(factory, chainId);
+      const reserveSig = await signReserve(adminSigner, factoryDomain, request);
+      await relayReserveTx(factory, owner, request, reserveSig);
+      bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
+
+      const strangerWalletAddress = await factory.predictBattleWalletAddress(stranger.address);
+      await factory.deployBattleWallet(stranger.address);
+
+      const cancelExpiresAt = await buildExpiration();
+      const cancelSig = await signCancel(
+        adminSigner,
+        factoryDomain,
+        request.gameId,
+        walletAddress,
+        opponentWalletAddress,
+        cancelExpiresAt,
+      );
+      await expect(
+        relayCancelTx(
+          factory,
+          owner,
+          walletAddress,
+          strangerWalletAddress,
+          request.gameId,
+          cancelExpiresAt,
+          cancelSig,
+        )
+      ).to.be.revertedWithCustomError(factory, "InvalidSignature");
+
+      const swappedExpiresAt = await buildExpiration();
+      const swappedSig = await signCancel(
+        adminSigner,
+        factoryDomain,
+        request.gameId,
+        opponentWalletAddress,
+        walletAddress,
+        swappedExpiresAt,
+      );
+      await expect(
+        relayCancelTx(
+          factory,
+          owner,
+          walletAddress,
+          opponentWalletAddress,
+          request.gameId,
+          swappedExpiresAt,
+          swappedSig,
+        )
       ).to.be.revertedWithCustomError(factory, "InvalidSignature");
     });
 
@@ -857,14 +1079,76 @@ describe("BattleWallet (EVM)", () => {
 
       const ttl = await factory.reservationTtl();
       await time.increase(Number(ttl) + 10);
-      const releaseSig = await signReleaseExpired(adminSigner, factoryDomain, walletAddress);
-      await relayReleaseExpiredTx(factory, owner, walletAddress, releaseSig);
+      const releaseExpiresAt = await buildExpiration();
+      const releaseSig = await signReleaseExpired(adminSigner, factoryDomain, walletAddress, true, releaseExpiresAt);
+      await relayReleaseExpiredTx(factory, owner, walletAddress, true, releaseExpiresAt, releaseSig);
 
       const totalsAfter = await wallet.getTotalReserved();
       expect(totalsAfter[0]).to.equal(0n);
 
       const active = await wallet.getAllGames();
       expect(active.length).to.equal(0);
+    });
+
+    it("releases all reservations once the original long ttl entry expires", async () => {
+      const {
+        chainId,
+        wallet,
+        walletAddress,
+        factory,
+        adminSigner,
+        owner,
+        opponentWalletAddress,
+        factoryOwner,
+      } = await loadFixture(deployFixture);
+
+      // set an initial long TTL
+      await factory.connect(factoryOwner).setReservationTtl(600);
+
+      const nonces = new Map();
+      const factoryDomain = buildFactoryDomain(factory, chainId);
+      const longReservation = withFactory(factory, {
+        gameId: await generateGameId(5000n),
+        amount: ethers.parseEther("1"),
+        player1: walletAddress,
+        player2: opponentWalletAddress,
+        isToken: false,
+        ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+      });
+      const longSig = await signReserve(adminSigner, factoryDomain, longReservation);
+      await relayReserveTx(factory, owner, longReservation, longSig);
+      bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
+
+      // set a shorter TTL, the prior long TTL may block expiration of this one
+      await factory.connect(factoryOwner).setReservationTtl(30);
+
+      const shortReservation = withFactory(factory, {
+        gameId: await generateGameId(5001n),
+        amount: ethers.parseEther("1"),
+        player1: walletAddress,
+        player2: opponentWalletAddress,
+        isToken: false,
+        ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+      });
+      const shortSig = await signReserve(adminSigner, factoryDomain, shortReservation);
+      await relayReserveTx(factory, owner, shortReservation, shortSig);
+
+      // everything still reserved
+      await wallet.connect(owner).releaseExpired();
+      const totalsBefore = await wallet.getTotalReserved();
+      expect(totalsBefore[0]).to.equal(ethers.parseEther("2"));
+
+      // advance 300, shorter TTL entry should be removed while the long TTL remains
+      await time.increase(300);
+      await wallet.connect(owner).releaseExpiredFullTraverse();
+      const totals2 = await wallet.getTotalReserved();
+      expect(totals2[0]).to.equal(ethers.parseEther("1"));
+
+      // advance another 300, both should expire
+      await time.increase(300);
+      await wallet.connect(owner).releaseExpiredFullTraverse();
+      const totalsFinal = await wallet.getTotalReserved();
+      expect(totalsFinal[0]).to.equal(0n);
     });
 
     it("rejects release relays without the approver signature", async () => {
@@ -887,13 +1171,14 @@ describe("BattleWallet (EVM)", () => {
       const ttl = await factory.reservationTtl();
       await time.increase(Number(ttl) + 1);
 
+      const releaseExpiresAt = await buildExpiration();
       await expect(
-        relayReleaseExpiredTx(factory, owner, walletAddress, EMPTY_SIG)
+        relayReleaseExpiredTx(factory, owner, walletAddress, false, releaseExpiresAt, EMPTY_SIG)
       ).to.be.revertedWithCustomError(factory, "ECDSAInvalidSignatureLength");
 
-      const badSig = await signReleaseExpired(owner, factoryDomain, walletAddress);
+      const badSig = await signReleaseExpired(owner, factoryDomain, walletAddress, false, releaseExpiresAt);
       await expect(
-        relayReleaseExpiredTx(factory, owner, walletAddress, badSig)
+        relayReleaseExpiredTx(factory, owner, walletAddress, false, releaseExpiresAt, badSig)
       ).to.be.revertedWithCustomError(factory, "InvalidSignature");
     });
 
@@ -924,6 +1209,190 @@ describe("BattleWallet (EVM)", () => {
       expect(found).to.equal(false);
     });
 
+    it("rejects releaseExpired signatures that are past expiration", async () => {
+      const { chainId, walletAddress, factory, adminSigner, owner, opponentWalletAddress } =
+        await loadFixture(deployFixture);
+
+      const nonces = new Map();
+      const factoryDomain = buildFactoryDomain(factory, chainId);
+      const request = withFactory(factory, {
+        gameId: await generateGameId(702n),
+        amount: ethers.parseEther("1"),
+        player1: walletAddress,
+        player2: opponentWalletAddress,
+        isToken: false,
+        ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+      });
+      const reserveSig = await signReserve(adminSigner, factoryDomain, request);
+      await relayReserveTx(factory, owner, request, reserveSig);
+
+      const ttl = await factory.reservationTtl();
+      await time.increase(Number(ttl) + 5);
+
+      const expiresAt = await buildExpiration(1n);
+      const releaseSig = await signReleaseExpired(adminSigner, factoryDomain, walletAddress, false, expiresAt);
+
+      await time.increase(5);
+
+      await expect(
+        relayReleaseExpiredTx(factory, owner, walletAddress, false, expiresAt, releaseSig)
+      ).to.be.revertedWithCustomError(factory, "InvalidSignature");
+    });
+
+    it("removes expired reservations that appear in the middle of the list", async () => {
+      const {
+        chainId,
+        wallet,
+        walletAddress,
+        factory,
+        adminSigner,
+        owner,
+        opponentWalletAddress,
+        factoryOwner,
+      } = await loadFixture(deployFixture);
+
+      const nonces = new Map();
+      const factoryDomain = buildFactoryDomain(factory, chainId);
+
+      await factory.connect(factoryOwner).setReservationTtl(3600);
+      const firstGameId = await generateGameId(8000n);
+      const firstAmount = ethers.parseEther("1");
+      const firstReservation = withFactory(factory, {
+        gameId: firstGameId,
+        amount: firstAmount,
+        player1: walletAddress,
+        player2: opponentWalletAddress,
+        isToken: false,
+        ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+      });
+      const firstSig = await signReserve(adminSigner, factoryDomain, firstReservation);
+      await relayReserveTx(factory, owner, firstReservation, firstSig);
+      bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
+
+      await factory.connect(factoryOwner).setReservationTtl(30);
+      const middleGameId = await generateGameId(8001n);
+      const middleAmount = ethers.parseEther("2");
+      const middleReservation = withFactory(factory, {
+        gameId: middleGameId,
+        amount: middleAmount,
+        player1: walletAddress,
+        player2: opponentWalletAddress,
+        isToken: false,
+        ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+      });
+      const middleSig = await signReserve(adminSigner, factoryDomain, middleReservation);
+      await relayReserveTx(factory, owner, middleReservation, middleSig);
+      bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
+
+      await factory.connect(factoryOwner).setReservationTtl(3600);
+      const lastGameId = await generateGameId(8002n);
+      const lastAmount = ethers.parseEther("3");
+      const lastReservation = withFactory(factory, {
+        gameId: lastGameId,
+        amount: lastAmount,
+        player1: walletAddress,
+        player2: opponentWalletAddress,
+        isToken: false,
+        ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+      });
+      const lastSig = await signReserve(adminSigner, factoryDomain, lastReservation);
+      await relayReserveTx(factory, owner, lastReservation, lastSig);
+
+      const totalsBefore = await wallet.getTotalReserved();
+      expect(totalsBefore[0]).to.equal(firstAmount + middleAmount + lastAmount);
+
+      await time.increase(31);
+      await wallet.connect(owner).releaseExpiredFullTraverse();
+
+      const totalsAfter = await wallet.getTotalReserved();
+      expect(totalsAfter[0]).to.equal(firstAmount + lastAmount);
+
+      const activeGames = await wallet.getAllGames();
+      expect(activeGames.map((id) => id.toString())).to.deep.equal([
+        firstGameId,
+        lastGameId,
+      ].map((id) => id.toString()));
+
+      const [, , , , middleFound] = await wallet.getReservationDetails(middleGameId);
+      expect(middleFound).to.equal(false);
+    });
+
+    it("removes expired reservations that appear at the end of the list", async () => {
+      const {
+        chainId,
+        wallet,
+        walletAddress,
+        factory,
+        adminSigner,
+        owner,
+        opponentWalletAddress,
+        factoryOwner,
+      } = await loadFixture(deployFixture);
+
+      const nonces = new Map();
+      const factoryDomain = buildFactoryDomain(factory, chainId);
+
+      const firstGameId = await generateGameId(8100n);
+      const firstAmount = ethers.parseEther("1");
+      const firstReservation = withFactory(factory, {
+        gameId: firstGameId,
+        amount: firstAmount,
+        player1: walletAddress,
+        player2: opponentWalletAddress,
+        isToken: false,
+        ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+      });
+      const firstSig = await signReserve(adminSigner, factoryDomain, firstReservation);
+      await relayReserveTx(factory, owner, firstReservation, firstSig);
+      bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
+
+      const secondGameId = await generateGameId(8101n);
+      const secondAmount = ethers.parseEther("1.5");
+      const secondReservation = withFactory(factory, {
+        gameId: secondGameId,
+        amount: secondAmount,
+        player1: walletAddress,
+        player2: opponentWalletAddress,
+        isToken: false,
+        ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+      });
+      const secondSig = await signReserve(adminSigner, factoryDomain, secondReservation);
+      await relayReserveTx(factory, owner, secondReservation, secondSig);
+      bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
+
+      await factory.connect(factoryOwner).setReservationTtl(30);
+      const lastGameId = await generateGameId(8102n);
+      const lastAmount = ethers.parseEther("2");
+      const lastReservation = withFactory(factory, {
+        gameId: lastGameId,
+        amount: lastAmount,
+        player1: walletAddress,
+        player2: opponentWalletAddress,
+        isToken: false,
+        ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+      });
+      const lastSig = await signReserve(adminSigner, factoryDomain, lastReservation);
+      await relayReserveTx(factory, owner, lastReservation, lastSig);
+
+      const totalsBefore = await wallet.getTotalReserved();
+      expect(totalsBefore[0]).to.equal(firstAmount + secondAmount + lastAmount);
+
+      await time.increase(31);
+      await wallet.connect(owner).releaseExpiredFullTraverse();
+
+      const totalsAfter = await wallet.getTotalReserved();
+      expect(totalsAfter[0]).to.equal(firstAmount + secondAmount);
+
+      const activeGames = await wallet.getAllGames();
+      expect(activeGames.map((id) => id.toString())).to.deep.equal([
+        firstGameId,
+        secondGameId,
+      ].map((id) => id.toString()));
+
+      const [, , , , lastFound] = await wallet.getReservationDetails(lastGameId);
+      expect(lastFound).to.equal(false);
+    });
+
     it("prevents non-owners from releasing expired reservations directly", async () => {
       const { chainId, wallet, walletAddress, factory, adminSigner, owner, opponentWalletAddress, stranger } =
         await loadFixture(deployFixture);
@@ -945,6 +1414,10 @@ describe("BattleWallet (EVM)", () => {
       await time.increase(Number(ttl) + 1);
 
       await expect(wallet.connect(stranger).releaseExpired()).to.be.revertedWithCustomError(
+        wallet,
+        "SenderNotAllowed"
+      );
+      await expect(wallet.connect(stranger).releaseExpiredFullTraverse()).to.be.revertedWithCustomError(
         wallet,
         "SenderNotAllowed"
       );
@@ -1055,13 +1528,22 @@ describe("BattleWallet (EVM)", () => {
       await relayReserveTx(factory, owner, newRequest, newSignerSig);
       bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
 
-      const cancelSig = await signCancel(newSigner, factoryDomain, newRequest.gameId);
+      const newSignerCancelExpiresAt = await buildExpiration();
+      const cancelSig = await signCancel(
+        newSigner,
+        factoryDomain,
+        newRequest.gameId,
+        walletAddress,
+        opponentWalletAddress,
+        newSignerCancelExpiresAt,
+      );
       await relayCancelTx(
         factory,
         owner,
         walletAddress,
         opponentWalletAddress,
         newRequest.gameId,
+        newSignerCancelExpiresAt,
         cancelSig
       );
     });
@@ -1153,15 +1635,21 @@ describe("BattleWallet (EVM)", () => {
       bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
 
       const [, , , , foundBefore] = await wallet.getReservationDetails(request.gameId);
-      expect(foundBefore).to.equal(false);
+      expect(foundBefore).to.equal(true);
 
       const settlement = withFactory(factory, {
         gameId: request.gameId,
         winner: opponentWalletAddress,
         loser: walletAddress,
       });
-      const settleSig = await signSettlement(adminSigner, factoryDomain, settlement);
-      await relaySettleTx(factory, owner, settlement, settleSig);
+      const approvalSettlementExpiresAt = await buildExpiration();
+      const settleSig = await signSettlement(
+        adminSigner,
+        factoryDomain,
+        settlement,
+        approvalSettlementExpiresAt,
+      );
+      await relaySettleTx(factory, owner, settlement, approvalSettlementExpiresAt, settleSig);
       const [, , , , foundAfter] = await wallet.getReservationDetails(request.gameId);
       expect(foundAfter).to.equal(false);
     });
@@ -1238,9 +1726,6 @@ describe("BattleWallet (EVM)", () => {
         }
       );
       bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
-
-      const [, , , , found] = await wallet.getReservationDetails(request.gameId);
-      expect(found).to.equal(false);
     });
 
   });
@@ -1303,10 +1788,16 @@ describe("BattleWallet (EVM)", () => {
         winner: opponentWalletAddress,
         loser: walletAddress,
       });
-      const settleSig = await signSettlement(adminSigner, factoryDomain, settlement);
+      const tokenLoseExpiresAt = await buildExpiration();
+      const settleSig = await signSettlement(
+        adminSigner,
+        factoryDomain,
+        settlement,
+        tokenLoseExpiresAt,
+      );
       const opponentBefore = await token.balanceOf(opponentWalletAddress);
       const feeBefore = await token.balanceOf(feeWallet.address);
-      await relaySettleTx(factory, owner, settlement, settleSig);
+      await relaySettleTx(factory, owner, settlement, tokenLoseExpiresAt, settleSig);
 
       const opponentAfter = await token.balanceOf(opponentWalletAddress);
       const feeAfter = await token.balanceOf(feeWallet.address);
@@ -1338,8 +1829,9 @@ describe("BattleWallet (EVM)", () => {
         winner: walletAddress,
         loser: opponentWalletAddress,
       });
-      const settleSig = await signSettlement(adminSigner, factoryDomain, settlement);
-      await relaySettleTx(factory, owner, settlement, settleSig);
+      const tokenWinExpiresAt = await buildExpiration();
+      const settleSig = await signSettlement(adminSigner, factoryDomain, settlement, tokenWinExpiresAt);
+      await relaySettleTx(factory, owner, settlement, tokenWinExpiresAt, settleSig);
 
       const finalTokBalance = await token.balanceOf(walletAddress);
       expect(finalTokBalance - initialTokBalance).to.equal(ethers.parseEther("15"));
@@ -1363,13 +1855,22 @@ describe("BattleWallet (EVM)", () => {
       await relayReserveTx(factory, owner, request, sig);
       bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
 
-      const cancelSig = await signCancel(adminSigner, factoryDomain, request.gameId);
+      const tokenCancelExpiresAt = await buildExpiration();
+      const cancelSig = await signCancel(
+        adminSigner,
+        factoryDomain,
+        request.gameId,
+        walletAddress,
+        opponentWalletAddress,
+        tokenCancelExpiresAt,
+      );
       await relayCancelTx(
         factory,
         owner,
         walletAddress,
         opponentWalletAddress,
         request.gameId,
+        tokenCancelExpiresAt,
         cancelSig
       );
       const totals = await wallet.getTotalReserved();
@@ -1397,8 +1898,9 @@ describe("BattleWallet (EVM)", () => {
 
       const ttl = await factory.reservationTtl();
       await time.increase(Number(ttl) + 10);
-      const releaseSig = await signReleaseExpired(adminSigner, factoryDomain, walletAddress);
-      await relayReleaseExpiredTx(factory, owner, walletAddress, releaseSig);
+      const releaseExpiresAt = await buildExpiration();
+      const releaseSig = await signReleaseExpired(adminSigner, factoryDomain, walletAddress, true, releaseExpiresAt);
+      await relayReleaseExpiredTx(factory, owner, walletAddress, true, releaseExpiresAt, releaseSig);
       const totals = await wallet.getTotalReserved();
       expect(totals[1]).to.equal(0n);
       const [, , , , found] = await wallet.getReservationDetails(request.gameId);
@@ -1606,8 +2108,14 @@ describe("BattleWallet (EVM)", () => {
             winner,
             loser,
           });
-          const settleSig = await signSettlement(adminSigner, factoryDomain, settlement);
-          await relaySettleTx(factory, owner, settlement, settleSig);
+          const stressSettlementExpiresAt = await buildExpiration();
+          const settleSig = await signSettlement(
+            adminSigner,
+            factoryDomain,
+            settlement,
+            stressSettlementExpiresAt,
+          );
+          await relaySettleTx(factory, owner, settlement, stressSettlementExpiresAt, settleSig);
           activeGames--;
         }
         await makeGame();
@@ -1624,8 +2132,9 @@ describe("BattleWallet (EVM)", () => {
       const totals = await wallet.calculateTotalReserved();
       expect(totals[0]).to.equal(0n);
       expect(totals[1]).to.equal(0n);
-      const releaseSig = await signReleaseExpired(adminSigner, factoryDomain, walletAddress);
-      await relayReleaseExpiredTx(factory, owner, walletAddress, releaseSig);
+      const releaseExpiresAt = await buildExpiration();
+      const releaseSig = await signReleaseExpired(adminSigner, factoryDomain, walletAddress, false, releaseExpiresAt);
+      await relayReleaseExpiredTx(factory, owner, walletAddress, false, releaseExpiresAt, releaseSig);
       const newStoredTotals = await wallet.getTotalReserved();
       expect(newStoredTotals[0]).to.equal(0n);
       expect(newStoredTotals[1]).to.equal(0n);
