@@ -52,7 +52,7 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712, Ownable2Step {
         "CANCEL(uint64 gameId,address walletOne,address walletTwo,address factory,uint64 expiresAt)"
     );
     bytes32 private constant RELEASE_EXPIRED_TYPEHASH = keccak256(
-        "RELEASE_EXPIRED(address wallet,address factory,bool fullTraverse,uint64 expiresAt)"
+        "RELEASE_EXPIRED(address wallet,address factory,bool fullTraverse,uint64 maxTraversals,uint64 expiresAt)"
     );
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -216,15 +216,16 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712, Ownable2Step {
     function relayReleaseExpired(
         address walletAddress,
         bool fullTraverse,
+        uint64 maxTraversals,
         uint64 expiresAt,
         bytes calldata releaseSignature
     ) external {
-        _verifyReleaseSignature(walletAddress, fullTraverse, expiresAt, releaseSignature);
+        _verifyReleaseSignature(walletAddress, fullTraverse, maxTraversals, expiresAt, releaseSignature);
         BattleWallet battleWallet = _verifyWallet(walletAddress);
         if (fullTraverse) {
             battleWallet.releaseExpiredFullTraverse();
         } else {
-            battleWallet.releaseExpired();
+            battleWallet.releaseExpired(maxTraversals);
         }
     }
 
@@ -294,12 +295,13 @@ contract BattleWalletFactory is ReentrancyGuard, EIP712, Ownable2Step {
     function _verifyReleaseSignature(
         address walletAddress,
         bool fullTraverse,
+        uint64 maxTraversals,
         uint64 expiresAt,
         bytes calldata signature
     ) private view {
         if (block.timestamp > expiresAt) revert InvalidSignature();
         bytes32 structHash = keccak256(
-            abi.encode(RELEASE_EXPIRED_TYPEHASH, walletAddress, address(this), fullTraverse, expiresAt)
+            abi.encode(RELEASE_EXPIRED_TYPEHASH, walletAddress, address(this), fullTraverse, maxTraversals, expiresAt)
         );
         bytes32 digest = _hashTypedDataV4(structHash);
         address signer = ECDSA.recover(digest, signature);

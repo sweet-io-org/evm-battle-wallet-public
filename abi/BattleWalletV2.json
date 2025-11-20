@@ -426,6 +426,24 @@
   },
   {
     "inputs": [],
+    "name": "getBattleRecord",
+    "outputs": [
+      {
+        "internalType": "uint64",
+        "name": "wins",
+        "type": "uint64"
+      },
+      {
+        "internalType": "uint64",
+        "name": "losses",
+        "type": "uint64"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
     "name": "getCurrentNonce",
     "outputs": [
       {
@@ -570,7 +588,13 @@
     "type": "function"
   },
   {
-    "inputs": [],
+    "inputs": [
+      {
+        "internalType": "uint64",
+        "name": "maxTraversals",
+        "type": "uint64"
+      }
+    ],
     "name": "releaseExpired",
     "outputs": [],
     "stateMutability": "nonpayable",
@@ -782,6 +806,19 @@
   },
   {
     "inputs": [],
+    "name": "totalLosses",
+    "outputs": [
+      {
+        "internalType": "uint64",
+        "name": "",
+        "type": "uint64"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
     "name": "totalReservedEth",
     "outputs": [
       {
@@ -801,6 +838,19 @@
         "internalType": "uint256",
         "name": "",
         "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "totalWins",
+    "outputs": [
+      {
+        "internalType": "uint64",
+        "name": "",
+        "type": "uint64"
       }
     ],
     "stateMutability": "view",

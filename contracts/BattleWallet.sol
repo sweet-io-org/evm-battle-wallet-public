@@ -95,6 +95,11 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
     uint256 public totalReservedEth;
     uint256 public totalReservedToken;
 
+    uint64 public totalWins;
+    uint64 public totalLosses;
+
+    uint64 private constant DEFAULT_RELEASE_TRAVERSAL_LIMIT = 50;
+
     // reservations is a linked list, in the order they come in --
     // which is also in order of TTL, so long as TTL is not changed
     mapping(uint64 => Reservation) private reservations;
@@ -106,7 +111,10 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
         "RESERVE(uint64 gameId,uint256 amount,address player1,address player2,bool isToken,uint64 noncePlayer1,uint64 noncePlayer2,address feeWallet,uint16 feeBasisPoints,address factory)"
     );
 
-    constructor() EIP712("BattleWallet", "1") {}
+    constructor() EIP712("BattleWallet", "1") {
+        // Prevent the implementation contract from being initialized directly.
+        initialized = true;
+    }
 
     // ─────────────────────────────────────────────────────────────────────────────
     // Events
@@ -136,6 +144,8 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
 
     function initialize(address owner_, address tokenAddress_) external {
         if (initialized) revert AlreadyInitialized();
+        // also guard against factory already being set and changed
+        if (factory != address(0)) revert AlreadyInitialized();
         if (owner_ == address(0)) {
             revert ZeroAddress();
         }
@@ -186,6 +196,9 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
             totalReservedEth -= res.amount;
         }
         emit ReservationSettled(request.gameId, request.winner, request.loser, res.amount, res.isToken);
+        unchecked {
+            ++totalWins;
+        }
         res.active = false;
     }
 
@@ -198,6 +211,9 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
         emit ReservationSettled(request.gameId, request.winner, request.loser, res.amount, res.isToken);
         res.active = false;
         if (res.opponent != request.winner) revert AddressMismatch();
+        unchecked {
+            ++totalLosses;
+        }
         if (res.isToken) {
             uint256 tokenBalance = token.balanceOf(address(this));
             if (res.amount > totalReservedToken) revert InsufficientReserved();
@@ -211,9 +227,9 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
         }
     }
 
-    function releaseExpired() external {
+    function releaseExpired(uint64 maxTraversals) external {
         if (msg.sender != factory && msg.sender != owner) revert SenderNotAllowed();
-        _releaseExpiredInternal();
+        _releaseExpiredInternal(maxTraversals);
     }
 
     function releaseExpiredFullTraverse() external {
@@ -242,7 +258,7 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
     function withdraw(uint256 amount) external onlyOwner nonReentrant {
         // always clear out expired items before determining if user can 
         // withdraw the amount
-        _releaseExpiredInternal();
+        _releaseExpiredInternal(DEFAULT_RELEASE_TRAVERSAL_LIMIT);
         if (amount == 0) revert InvalidAmount();
         if (address(this).balance < totalReservedEth) revert InsufficientFunds();
         uint256 available = address(this).balance - totalReservedEth;
@@ -253,7 +269,7 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
 
     function withdrawToken(uint256 amount) external onlyOwner nonReentrant {
         if (!tokenSet) revert NoTokenWallet();
-        _releaseExpiredInternal();
+        _releaseExpiredInternal(DEFAULT_RELEASE_TRAVERSAL_LIMIT);
         if (amount == 0) revert InvalidAmount();
         uint256 tokenBalance = token.balanceOf(address(this));
         if (tokenBalance < totalReservedToken) revert InsufficientFunds();
@@ -363,6 +379,10 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
         return nextNonce;
     }
 
+    function getBattleRecord() external view returns (uint64 wins, uint64 losses) {
+        return (totalWins, totalLosses);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────────
     // Internal helpers
     // ─────────────────────────────────────────────────────────────────────────────
@@ -392,7 +412,7 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
         // but prevents non-settleable reservations from being inserted
         if (!(expiration > block.timestamp)) revert ExpiredInPast();
 
-        _releaseExpiredInternal();
+        _releaseExpiredInternal(DEFAULT_RELEASE_TRAVERSAL_LIMIT);
         if (reservations[request.gameId].exists) revert GameExists();
 
         if (request.isToken) {
@@ -436,9 +456,13 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
         emit Reserved(request.gameId, opponent, request.amount, request.isToken);
     }
 
-    function _releaseExpiredInternal() private {
+    function _releaseExpiredInternal(uint64 maxTraversals) private {
         uint64 currGameId = firstGameId;
         if (currGameId == 0) {
+            return;
+        }
+
+        if (maxTraversals == 0) {
             return;
         }
 
@@ -447,7 +471,8 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
         uint256 totalToken = totalReservedToken;
 
         uint64 nextGameId;
-        while (currGameId != 0) {
+        uint64 traversed;
+        while (currGameId != 0 && traversed < maxTraversals) {
             Reservation storage res = reservations[currGameId];
             if (currentTime < res.expiration) {
                 break;
@@ -470,6 +495,9 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
 
             delete reservations[currGameId];
             currGameId = nextGameId;
+            unchecked {
+                ++traversed;
+            }
         }
 
         // handle state updates in one pass rather than 
@@ -592,7 +620,7 @@ contract BattleWallet is ReentrancyGuard, EIP712 {
         payout = amount - fee;
 
         token.safeTransfer(winner, payout);
-        if (fee > 0) {
+        if (fee > 0 && feeWallet != address(0)) {
             token.safeTransfer(feeWallet, fee);
         }
     }
