@@ -34,6 +34,7 @@ const RELEASE_EXPIRED_TYPES = {
     { name: "wallet", type: "address" },
     { name: "factory", type: "address" },
     { name: "fullTraverse", type: "bool" },
+    { name: "maxTraversals", type: "uint64" },
     { name: "expiresAt", type: "uint64" },
   ],
 };
@@ -60,6 +61,7 @@ const UPGRADE_TYPES = {
 const EMPTY_SIG = "0x";
 
 const DEFAULT_SIGNATURE_TTL = 3600n;
+const DEFAULT_RELEASE_TRAVERSAL_LIMIT = 50;
 
 async function buildExpiration(delta = DEFAULT_SIGNATURE_TTL) {
   const latest = BigInt(await time.latest());
@@ -127,8 +129,18 @@ function relayCancelTx(factory, caller, walletOne, walletTwo, gameId, expiresAt,
     .relayCancel(walletOne, walletTwo, gameId, expiresAt, signature);
 }
 
-function relayReleaseExpiredTx(factory, caller, walletAddress, fullTraverse, expiresAt, signature) {
-  return factory.connect(caller).relayReleaseExpired(walletAddress, fullTraverse, expiresAt, signature);
+function relayReleaseExpiredTx(
+  factory,
+  caller,
+  walletAddress,
+  fullTraverse,
+  maxTraversals,
+  expiresAt,
+  signature,
+) {
+  return factory
+    .connect(caller)
+    .relayReleaseExpired(walletAddress, fullTraverse, maxTraversals, expiresAt, signature);
 }
 
 function randomInt(min, max) {
@@ -185,11 +197,20 @@ async function signCancel(signer, domain, gameId, walletOne, walletTwo, expiresA
   });
 }
 
-async function signReleaseExpired(signer, domain, walletAddress, fullTraverse, expiresAt, factoryOverride) {
+async function signReleaseExpired(
+  signer,
+  domain,
+  walletAddress,
+  fullTraverse,
+  maxTraversals,
+  expiresAt,
+  factoryOverride,
+) {
   return signer.signTypedData(domain, RELEASE_EXPIRED_TYPES, {
     wallet: walletAddress,
     factory: factoryOverride ?? domain.verifyingContract,
     fullTraverse,
+    maxTraversals,
     expiresAt,
   });
 }
@@ -630,6 +651,109 @@ describe("BattleWallet (EVM)", () => {
 
       const totals = await wallet.getTotalReserved();
       expect(totals[0]).to.equal(0n);
+    });
+
+    it("tracks wins and losses and reports the battle record", async () => {
+      const {
+        chainId,
+        wallet,
+        walletAddress,
+        factory,
+        owner,
+        adminSigner,
+        opponentWalletAddress,
+      } = await loadFixture(deployFixture);
+      const factoryDomain = buildFactoryDomain(factory, chainId);
+      const nonces = new Map();
+
+      const initialRecord = await wallet.getBattleRecord();
+      expect(initialRecord[0]).to.equal(0n);
+      expect(initialRecord[1]).to.equal(0n);
+
+      const winRequest = withFactory(factory, {
+        gameId: await generateGameId(41n),
+        amount: ethers.parseEther("3"),
+        player1: walletAddress,
+        player2: opponentWalletAddress,
+        isToken: false,
+        ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+      });
+      const winReserveSig = await signReserve(adminSigner, factoryDomain, winRequest);
+      await relayReserveTx(factory, owner, winRequest, winReserveSig);
+      bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
+
+      const winningSettlement = withFactory(factory, {
+        gameId: winRequest.gameId,
+        winner: walletAddress,
+        loser: opponentWalletAddress,
+      });
+      const winExpiresAt = await buildExpiration();
+      const winSettleSig = await signSettlement(adminSigner, factoryDomain, winningSettlement, winExpiresAt);
+      await relaySettleTx(factory, owner, winningSettlement, winExpiresAt, winSettleSig);
+
+      const postWinRecord = await wallet.getBattleRecord();
+      expect(postWinRecord[0]).to.equal(1n);
+      expect(postWinRecord[1]).to.equal(0n);
+
+      const lossRequest = withFactory(factory, {
+        gameId: await generateGameId(42n),
+        amount: ethers.parseEther("2"),
+        player1: walletAddress,
+        player2: opponentWalletAddress,
+        isToken: false,
+        ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+      });
+      const lossReserveSig = await signReserve(adminSigner, factoryDomain, lossRequest);
+      await relayReserveTx(factory, owner, lossRequest, lossReserveSig);
+      bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
+
+      const losingSettlement = withFactory(factory, {
+        gameId: lossRequest.gameId,
+        winner: opponentWalletAddress,
+        loser: walletAddress,
+      });
+      const lossExpiresAt = await buildExpiration();
+      const lossSettleSig = await signSettlement(adminSigner, factoryDomain, losingSettlement, lossExpiresAt);
+      await relaySettleTx(factory, owner, losingSettlement, lossExpiresAt, lossSettleSig);
+
+      const postLossRecord = await wallet.getBattleRecord();
+      expect(postLossRecord[0]).to.equal(1n);
+      expect(postLossRecord[1]).to.equal(1n);
+
+      const cancelRequest = withFactory(factory, {
+        gameId: await generateGameId(43n),
+        amount: ethers.parseEther("1"),
+        player1: walletAddress,
+        player2: opponentWalletAddress,
+        isToken: false,
+        ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+      });
+      const cancelReserveSig = await signReserve(adminSigner, factoryDomain, cancelRequest);
+      await relayReserveTx(factory, owner, cancelRequest, cancelReserveSig);
+      bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
+
+      const cancelExpiresAt = await buildExpiration();
+      const cancelSig = await signCancel(
+        adminSigner,
+        factoryDomain,
+        cancelRequest.gameId,
+        walletAddress,
+        opponentWalletAddress,
+        cancelExpiresAt,
+      );
+      await relayCancelTx(
+        factory,
+        owner,
+        walletAddress,
+        opponentWalletAddress,
+        cancelRequest.gameId,
+        cancelExpiresAt,
+        cancelSig,
+      );
+
+      const postCancelRecord = await wallet.getBattleRecord();
+      expect(postCancelRecord[0]).to.equal(1n);
+      expect(postCancelRecord[1]).to.equal(1n);
     });
 
     it("rejects settlement when addresses do not match reservation", async () => {
@@ -1080,8 +1204,23 @@ describe("BattleWallet (EVM)", () => {
       const ttl = await factory.reservationTtl();
       await time.increase(Number(ttl) + 10);
       const releaseExpiresAt = await buildExpiration();
-      const releaseSig = await signReleaseExpired(adminSigner, factoryDomain, walletAddress, true, releaseExpiresAt);
-      await relayReleaseExpiredTx(factory, owner, walletAddress, true, releaseExpiresAt, releaseSig);
+      const releaseSig = await signReleaseExpired(
+        adminSigner,
+        factoryDomain,
+        walletAddress,
+        true,
+        0,
+        releaseExpiresAt,
+      );
+      await relayReleaseExpiredTx(
+        factory,
+        owner,
+        walletAddress,
+        true,
+        0,
+        releaseExpiresAt,
+        releaseSig,
+      );
 
       const totalsAfter = await wallet.getTotalReserved();
       expect(totalsAfter[0]).to.equal(0n);
@@ -1134,7 +1273,7 @@ describe("BattleWallet (EVM)", () => {
       await relayReserveTx(factory, owner, shortReservation, shortSig);
 
       // everything still reserved
-      await wallet.connect(owner).releaseExpired();
+      await wallet.connect(owner).releaseExpired(DEFAULT_RELEASE_TRAVERSAL_LIMIT);
       const totalsBefore = await wallet.getTotalReserved();
       expect(totalsBefore[0]).to.equal(ethers.parseEther("2"));
 
@@ -1173,12 +1312,35 @@ describe("BattleWallet (EVM)", () => {
 
       const releaseExpiresAt = await buildExpiration();
       await expect(
-        relayReleaseExpiredTx(factory, owner, walletAddress, false, releaseExpiresAt, EMPTY_SIG)
+        relayReleaseExpiredTx(
+          factory,
+          owner,
+          walletAddress,
+          false,
+          DEFAULT_RELEASE_TRAVERSAL_LIMIT,
+          releaseExpiresAt,
+          EMPTY_SIG,
+        )
       ).to.be.revertedWithCustomError(factory, "ECDSAInvalidSignatureLength");
 
-      const badSig = await signReleaseExpired(owner, factoryDomain, walletAddress, false, releaseExpiresAt);
+      const badSig = await signReleaseExpired(
+        owner,
+        factoryDomain,
+        walletAddress,
+        false,
+        DEFAULT_RELEASE_TRAVERSAL_LIMIT,
+        releaseExpiresAt,
+      );
       await expect(
-        relayReleaseExpiredTx(factory, owner, walletAddress, false, releaseExpiresAt, badSig)
+        relayReleaseExpiredTx(
+          factory,
+          owner,
+          walletAddress,
+          false,
+          DEFAULT_RELEASE_TRAVERSAL_LIMIT,
+          releaseExpiresAt,
+          badSig,
+        )
       ).to.be.revertedWithCustomError(factory, "InvalidSignature");
     });
 
@@ -1201,7 +1363,7 @@ describe("BattleWallet (EVM)", () => {
 
       const ttl = await factory.reservationTtl();
       await time.increase(Number(ttl) + 1);
-      await wallet.connect(owner).releaseExpired();
+      await wallet.connect(owner).releaseExpired(DEFAULT_RELEASE_TRAVERSAL_LIMIT);
 
       const totalsAfter = await wallet.getTotalReserved();
       expect(totalsAfter[0]).to.equal(0n);
@@ -1230,13 +1392,72 @@ describe("BattleWallet (EVM)", () => {
       await time.increase(Number(ttl) + 5);
 
       const expiresAt = await buildExpiration(1n);
-      const releaseSig = await signReleaseExpired(adminSigner, factoryDomain, walletAddress, false, expiresAt);
+      const releaseSig = await signReleaseExpired(
+        adminSigner,
+        factoryDomain,
+        walletAddress,
+        false,
+        DEFAULT_RELEASE_TRAVERSAL_LIMIT,
+        expiresAt,
+      );
 
       await time.increase(5);
 
       await expect(
-        relayReleaseExpiredTx(factory, owner, walletAddress, false, expiresAt, releaseSig)
+        relayReleaseExpiredTx(
+          factory,
+          owner,
+          walletAddress,
+          false,
+          DEFAULT_RELEASE_TRAVERSAL_LIMIT,
+          expiresAt,
+          releaseSig,
+        )
       ).to.be.revertedWithCustomError(factory, "InvalidSignature");
+    });
+
+    it("removes up to fifty expired reservations within traversal bounds", async () => {
+      const {
+        chainId,
+        wallet,
+        walletAddress,
+        factory,
+        adminSigner,
+        owner,
+        opponentWalletAddress,
+        factoryOwner,
+      } = await loadFixture(deployFixture);
+
+      await factory.connect(factoryOwner).setReservationTtl(60);
+
+      const nonces = new Map();
+      const factoryDomain = buildFactoryDomain(factory, chainId);
+
+      for (let i = 0; i < DEFAULT_RELEASE_TRAVERSAL_LIMIT; i++) {
+        const request = withFactory(factory, {
+          gameId: await generateGameId(BigInt(7500 + i)),
+          amount: ethers.parseEther("0.1"),
+          player1: walletAddress,
+          player2: opponentWalletAddress,
+          isToken: false,
+          ...assignNonces(nonces, walletAddress, opponentWalletAddress),
+        });
+        const reserveSig = await signReserve(adminSigner, factoryDomain, request);
+        await relayReserveTx(factory, owner, request, reserveSig);
+        bumpNoncesAfterReserve(nonces, walletAddress, opponentWalletAddress);
+      }
+
+      const ttl = await factory.reservationTtl();
+      await time.increase(Number(ttl) + 1);
+
+      const releaseTx = await wallet.connect(owner).releaseExpired(DEFAULT_RELEASE_TRAVERSAL_LIMIT);
+      const receipt = await releaseTx.wait();
+      expect(receipt.gasUsed).to.be.lessThan(5_000_000n);
+
+      const totalsAfter = await wallet.getTotalReserved();
+      expect(totalsAfter[0]).to.equal(0n);
+      const activeGames = await wallet.getAllGames();
+      expect(activeGames.length).to.equal(0);
     });
 
     it("removes expired reservations that appear in the middle of the list", async () => {
@@ -1413,7 +1634,9 @@ describe("BattleWallet (EVM)", () => {
       const ttl = await factory.reservationTtl();
       await time.increase(Number(ttl) + 1);
 
-      await expect(wallet.connect(stranger).releaseExpired()).to.be.revertedWithCustomError(
+      await expect(
+        wallet.connect(stranger).releaseExpired(DEFAULT_RELEASE_TRAVERSAL_LIMIT)
+      ).to.be.revertedWithCustomError(
         wallet,
         "SenderNotAllowed"
       );
@@ -1422,7 +1645,7 @@ describe("BattleWallet (EVM)", () => {
         "SenderNotAllowed"
       );
 
-      await wallet.connect(owner).releaseExpired();
+      await wallet.connect(owner).releaseExpired(DEFAULT_RELEASE_TRAVERSAL_LIMIT);
       const totalsAfter = await wallet.getTotalReserved();
       expect(totalsAfter[0]).to.equal(0n);
     });
@@ -1456,6 +1679,8 @@ describe("BattleWallet (EVM)", () => {
 
       const ttl = await factory.reservationTtl();
       await time.increase(Number(ttl) + 200);
+
+      await wallet.connect(owner).releaseExpired(200);
 
       const newTotals = await wallet.calculateTotalReserved();
       expect(newTotals[0]).to.equal(0n);
@@ -1899,8 +2124,23 @@ describe("BattleWallet (EVM)", () => {
       const ttl = await factory.reservationTtl();
       await time.increase(Number(ttl) + 10);
       const releaseExpiresAt = await buildExpiration();
-      const releaseSig = await signReleaseExpired(adminSigner, factoryDomain, walletAddress, true, releaseExpiresAt);
-      await relayReleaseExpiredTx(factory, owner, walletAddress, true, releaseExpiresAt, releaseSig);
+      const releaseSig = await signReleaseExpired(
+        adminSigner,
+        factoryDomain,
+        walletAddress,
+        true,
+        0,
+        releaseExpiresAt,
+      );
+      await relayReleaseExpiredTx(
+        factory,
+        owner,
+        walletAddress,
+        true,
+        0,
+        releaseExpiresAt,
+        releaseSig,
+      );
       const totals = await wallet.getTotalReserved();
       expect(totals[1]).to.equal(0n);
       const [, , , , found] = await wallet.getReservationDetails(request.gameId);
@@ -1946,6 +2186,8 @@ describe("BattleWallet (EVM)", () => {
 
       const ttl = await factory.reservationTtl();
       await time.increase(Number(ttl) + 200);
+
+      await wallet.connect(owner).releaseExpired(250);
 
       const newTotals = await wallet.calculateTotalReserved();
       expect(newTotals[0]).to.equal(0n);
@@ -2133,8 +2375,24 @@ describe("BattleWallet (EVM)", () => {
       expect(totals[0]).to.equal(0n);
       expect(totals[1]).to.equal(0n);
       const releaseExpiresAt = await buildExpiration();
-      const releaseSig = await signReleaseExpired(adminSigner, factoryDomain, walletAddress, false, releaseExpiresAt);
-      await relayReleaseExpiredTx(factory, owner, walletAddress, false, releaseExpiresAt, releaseSig);
+      const releaseTraversalLimit = 2000;
+      const releaseSig = await signReleaseExpired(
+        adminSigner,
+        factoryDomain,
+        walletAddress,
+        false,
+        releaseTraversalLimit,
+        releaseExpiresAt,
+      );
+      await relayReleaseExpiredTx(
+        factory,
+        owner,
+        walletAddress,
+        false,
+        releaseTraversalLimit,
+        releaseExpiresAt,
+        releaseSig,
+      );
       const newStoredTotals = await wallet.getTotalReserved();
       expect(newStoredTotals[0]).to.equal(0n);
       expect(newStoredTotals[1]).to.equal(0n);
